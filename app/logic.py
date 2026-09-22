@@ -12,6 +12,7 @@ import json
 import sqlite3
 from typing import Optional
 
+from . import alerts
 from .schemas import IngestResponse, PackageIn
 
 
@@ -126,6 +127,7 @@ def ingest_package(conn: sqlite3.Connection, pkg: PackageIn, key: str) -> Ingest
     )
 
     committed_seqs = []
+    committed_payloads = []
     cur = committed_upto + 1
     while True:
         row = conn.execute(
@@ -142,6 +144,7 @@ def ingest_package(conn: sqlite3.Connection, pkg: PackageIn, key: str) -> Ingest
             "DELETE FROM buffer WHERE device_id = ? AND seq = ?", (pkg.device_id, cur)
         )
         committed_seqs.append(cur)
+        committed_payloads.append((cur, row["payload_json"]))
         cur += 1
 
     committed_upto = cur - 1
@@ -149,6 +152,10 @@ def ingest_package(conn: sqlite3.Connection, pkg: PackageIn, key: str) -> Ingest
         "UPDATE devices SET committed_upto = ? WHERE device_id = ?",
         (committed_upto, pkg.device_id),
     )
+
+    # 阈值告警：仅对本次按序排水的包评估，每个包恰好一次。
+    # 规则在包创建之后才建立时不回溯历史提交（历史已按当时规则集处理完毕）。
+    alerts.evaluate_drain(conn, pkg.device_id, committed_payloads)
 
     response = IngestResponse(
         status="committed" if pkg.seq in committed_seqs else "buffered",

@@ -56,6 +56,54 @@ CREATE TABLE IF NOT EXISTS duplicates (
 );
 
 CREATE INDEX IF NOT EXISTS idx_duplicates_device ON duplicates (device_id, id);
+
+-- 持久化阈值告警规则：按 (设备, 指标) 唯一，上下限至少配置一个
+CREATE TABLE IF NOT EXISTS alert_rules (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id       TEXT NOT NULL,
+    metric          TEXT NOT NULL,
+    upper_limit     REAL,                     -- 上限；value > upper_limit 视为越界，null 表示不限
+    lower_limit     REAL,                     -- 下限；value < lower_limit 视为越界，null 表示不限
+    trigger_count   INTEGER NOT NULL,         -- 连续越界多少次触发告警
+    recovery_count  INTEGER NOT NULL,         -- 告警后连续不越界多少次恢复
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE (device_id, metric),
+    CHECK (upper_limit IS NOT NULL OR lower_limit IS NOT NULL),
+    CHECK (trigger_count >= 1),
+    CHECK (recovery_count >= 1),
+    CHECK (lower_limit IS NULL OR upper_limit IS NULL OR lower_limit <= upper_limit)
+);
+
+-- 规则的迟滞状态机状态：与规则一对一
+CREATE TABLE IF NOT EXISTS alert_rule_states (
+    rule_id          INTEGER PRIMARY KEY REFERENCES alert_rules (id) ON DELETE CASCADE,
+    state            TEXT NOT NULL DEFAULT 'normal',  -- normal / triggered
+    breach_streak    INTEGER NOT NULL DEFAULT 0,      -- 连续越界计数
+    recovery_streak  INTEGER NOT NULL DEFAULT 0,      -- 告警后连续不越界计数
+    last_value       REAL,
+    last_seq         INTEGER,
+    last_evaluated_at TEXT
+);
+
+-- 告警 / 恢复事件，按提交顺序单调写入（id 即提交先后序号）
+CREATE TABLE IF NOT EXISTS alert_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id         INTEGER REFERENCES alert_rules (id) ON DELETE SET NULL,
+                    -- 规则删除后置 null，事件本身保留可查
+    device_id       TEXT NOT NULL,
+    metric          TEXT NOT NULL,
+    seq             INTEGER NOT NULL,         -- 触发 / 恢复时所处理的包序号
+    event_type      TEXT NOT NULL,            -- triggered / recovered
+    value           REAL NOT NULL,            -- 触发或恢复的那个测量值
+    event_time      TEXT,                     -- 测量值 ts；无 ts 时取包 sent_at；再无则提交时刻
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_events_device_metric
+    ON alert_events (device_id, metric, id);
+CREATE INDEX IF NOT EXISTS idx_alert_events_rule ON alert_events (rule_id, id);
 """
 
 

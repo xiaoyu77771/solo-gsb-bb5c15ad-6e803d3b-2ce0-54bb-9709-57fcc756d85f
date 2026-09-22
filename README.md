@@ -2,31 +2,37 @@
 
 基于 **FastAPI + SQLite** 的仪器批量测量包接收服务。仪器按设备上报带序号的测量包，服务提供：
 
-- **幂等去重**：每个包携带幂等键，重试 / 重发不会产生重复数据；
-- **乱序缓冲**：序号不连续的包先暂存，缺口补齐后**按序连续提交**；
+- **幂等去重**：每个包携带幂等键，重试 / 重发不会产生重复数据或重复告警事件；
+- **乱序缓冲**：序号不连续的包先暂存，缺口补齐后**按序连续提交**（告警也按该提交顺序评估）；
 - **可观测接口**：查询每台设备的缺口、已提交序号与重复包记录；
-- **窗口聚合**：按事件时间（`sent_at`）把已提交测量分入半开窗口，输出 count / min / max / mean，并以水位机制隔离迟到样本。
+- **窗口聚合**：按事件时间（`sent_at`）把已提交测量分入半开窗口，输出 count / min / max / mean，并以水位机制隔离迟到样本；
+- **持久化阈值告警**：按设备 + 指标配置上限 / 下限与连续触发、恢复次数，带连续计数的迟滞状态机防抖动，规则状态与告警 / 恢复事件持久化在 SQLite。
 
 ## 快速开始
 
-### Docker Compose（推荐）
-
-单条命令启动（构建镜像 + 安装依赖 + 建库 + 起服务）：
+### Docker Compose（推荐，单命令）
 
 ```bash
 docker compose up --build
 ```
 
-容器启动时自动安装依赖（`docker-entrypoint.sh`），应用启动钩子自动创建 SQLite 数据库与表结构。数据库文件持久化在命名卷 `lab-data`（容器内 `/data/lab.db`）。
+这一条命令完成全部初始化：构建镜像 → 容器内安装依赖（`docker-entrypoint.sh`）→
+应用启动钩子自动创建 SQLite 数据库与全部表结构（含告警规则、规则状态、告警事件表）→ 启动服务。
+数据库文件持久化在命名卷 `lab-data`（容器内 `/data/lab.db`），重启不丢规则与事件。
 
 服务地址：http://localhost:8000 ，交互式文档：http://localhost:8000/docs
 
-### 本地开发
+### 本地开发（单命令初始化 + 起服务）
 
 ```bash
 pip install -r requirements-dev.txt   # 初始化依赖（含运行时与 pytest）
 uvicorn app.main:app --reload         # 数据库默认创建在 ./lab.db，可用 DB_PATH 覆盖
-pytest tests/                         # 运行测试
+```
+
+另起终端运行测试：
+
+```bash
+pytest tests/
 ```
 
 ## 数据模型
@@ -74,6 +80,13 @@ pytest tests/                         # 运行测试
 | GET | `/api/v1/devices/{id}/committed` | 已提交序号（支持 `from_seq`/`to_seq`/`limit`/`offset`） |
 | GET | `/api/v1/devices/{id}/duplicates` | 重复包记录（可按 `reason` 过滤） |
 | GET | `/api/v1/devices/{id}/metrics/rollup` | 按事件时间的窗口聚合（count/min/max/mean + 水位迟到统计） |
+| POST | `/api/v1/rules` | 创建阈值告警规则（按 设备+指标 唯一） |
+| GET | `/api/v1/rules` | 规则列表（可按 `device_id`/`metric` 过滤） |
+| GET | `/api/v1/rules/{rule_id}` | 规则详情 |
+| PUT | `/api/v1/rules/{rule_id}` | 全量更新规则（上下限、连续次数、启用状态） |
+| DELETE | `/api/v1/rules/{rule_id}` | 删除规则（历史事件保留） |
+| GET | `/api/v1/alerts` | 当前仍处于告警中的规则（可按 `device_id`/`metric` 过滤） |
+| GET | `/api/v1/devices/{id}/alerts/events` | 按设备、可选指标分页查询触发/恢复事件 |
 
 ## 窗口聚合（Rollup）
 
@@ -102,6 +115,92 @@ curl 'localhost:8000/api/v1/devices/ph-meter-01/metrics/rollup?metric=temperatur
 #     "window_seconds":300.0,"allowed_lateness":60.0,
 #     "watermark":"2026-09-22T08:59:00Z","late_count":0,
 #     "windows":[{"start":"...","end":"...","count":3,"min":21.0,"max":21.6,"mean":21.3}, ...]}
+```
+
+## 阈值告警（Threshold Alerts）
+
+按 **设备 + 指标** 配置规则（同一组合仅一条）：
+
+| 字段 | 说明 |
+|---|---|
+| `upper_limit` / `lower_limit` | 上限 / 下限，**至少提供一个**；严格比较：`value > 上限` 或 `value < 下限` 才算越界，等于阈值不越界 |
+| `trigger_count` | 连续越界多少次后触发告警（默认 1） |
+| `recovery_count` | 告警后连续多少次不越界才恢复（默认 1），与触发阈值相互独立，形成迟滞 |
+| `enabled` | 是否启用；禁用期间不评估，重新启用不回溯历史包 |
+
+### 迟滞状态机（防抖动）
+
+规则状态持久化在 `alert_rule_states`，每条规则一个状态机：
+
+- **normal**：维护连续越界计数 `breach_streak`，越界 +1、不越界清零；达到 `trigger_count` 时翻转为 **triggered** 并写入一条 `triggered` 事件；
+- **triggered**：维护连续恢复计数 `recovery_streak`，不越界 +1、再次越界清零（抖动被吸收，不会反复告警）；达到 `recovery_count` 时翻回 **normal** 并写入一条 `recovered` 事件；
+- 包内没有该指标的测量值时该规则**跳过、计数不变**（缺数不等于恢复）；一个包内含同一指标多个测量值时，按 measurements 的提交顺序逐个推进状态机。
+
+### 评估时机：只认提交顺序
+
+- 评估只发生在包**按序排水提交**时：缓冲中的包不评估，重复包（幂等重放 / `already_committed` / `already_buffered`）直接短路，**绝不重复产生事件**；
+- 乱序缺口被补齐时，缓冲包按 seq 升序一次性排水，每个包**只按这一次提交顺序**评估；
+- 规则在建规则之前已提交的历史包**不回溯**；
+- 规则配置被更新时，保留当前是否告警的状态，但清零两个连续计数，避免沿用旧阈值的计数误判；
+- 删除规则会级联删除其状态（当前告警消失），历史事件保留、`rule_id` 置空。
+
+事件的**时间与序号**：
+
+- 事件序号 `id` 为全表单递增自增，即按实际提交处理顺序编号；`seq` 为触发 / 恢复时处理的包序号（同包内多个测量值可触发+恢复，序号相同、`id` 不同）；
+- 事件时间优先取测量值 `ts`，其次取包的 `sent_at`，均无则用提交时刻（UTC，`Z` 结尾）。
+
+### 接口示例
+
+创建规则（温度上限 30：连续 2 次越界触发，连续 2 次回限内恢复）：
+
+```bash
+curl -X POST localhost:8000/api/v1/rules -H 'Content-Type: application/json' -d '{
+  "device_id": "ph-meter-01", "metric": "temperature",
+  "upper_limit": 30, "trigger_count": 2, "recovery_count": 2
+}'
+# => 201 {"id":1,"device_id":"ph-meter-01","metric":"temperature",
+#        "upper_limit":30.0,"lower_limit":null,"trigger_count":2,
+#        "recovery_count":2,"enabled":true,"created_at":"...","updated_at":"..."}
+```
+
+更新（全量替换）/ 删除：
+
+```bash
+curl -X PUT localhost:8000/api/v1/rules/1 -H 'Content-Type: application/json' -d '{
+  "upper_limit": 40, "lower_limit": 0, "trigger_count": 3,
+  "recovery_count": 2, "enabled": true
+}'
+curl -X DELETE localhost:8000/api/v1/rules/1      # 204；历史事件保留
+```
+
+上报测量包（接口与前述完全一致，提交时自动评估）：
+
+```bash
+curl -X POST localhost:8000/api/v1/packages -H 'Content-Type: application/json' -d '{
+  "device_id": "ph-meter-01", "seq": 1, "idempotency_key": "k-1",
+  "measurements": [{"metric": "temperature", "value": 31.2, "ts": "2026-09-22T08:00:00Z"}]
+}'
+```
+
+查询当前告警（触发后、恢复前）：
+
+```bash
+curl 'localhost:8000/api/v1/alerts?device_id=ph-meter-01'
+# => {"count":1,"alerts":[{"rule_id":1,"device_id":"ph-meter-01","metric":"temperature",
+#        "upper_limit":30.0,"lower_limit":null,"trigger_count":2,"recovery_count":2,
+#        "triggered_seq":4,"triggered_event_id":7,"triggered_at":"2026-09-22T08:00:04Z",
+#        "last_value":33.0,"last_seq":4,"recovery_streak":0}]}
+```
+
+按设备、指标分页查询事件（`limit`/`offset`，可按 `event_type=triggered|recovered` 过滤）：
+
+```bash
+curl 'localhost:8000/api/v1/devices/ph-meter-01/alerts/events?metric=temperature&limit=50&offset=0'
+# => {"count":2,"limit":50,"offset":0,"events":[
+#       {"id":7,"rule_id":1,"device_id":"ph-meter-01","metric":"temperature","seq":4,
+#        "event_type":"triggered","value":33.0,"event_time":"2026-09-22T08:00:04Z","created_at":"..."},
+#       {"id":8,"rule_id":1,"device_id":"ph-meter-01","metric":"temperature","seq":8,
+#        "event_type":"recovered","value":27.0,"event_time":"2026-09-22T08:00:08Z","created_at":"..."}]}
 ```
 
 ### 示例
@@ -148,7 +247,8 @@ curl localhost:8000/api/v1/devices/ph-meter-01/duplicates   # 重复包记录
 ```
 app/
   main.py     # FastAPI 路由
-  logic.py    # 摄入核心：幂等判定、缓冲、排水提交
+  logic.py    # 摄入核心：幂等判定、缓冲、排水提交（提交时驱动告警评估）
+  alerts.py   # 阈值告警：规则 CRUD、带连续计数的迟滞状态机、按提交顺序评估
   rollup.py   # 窗口聚合：半开窗口分桶、水位迟到判定
   db.py       # SQLite 连接与建表（启动时自动执行）
   schemas.py  # Pydantic 模型
@@ -156,6 +256,7 @@ tests/
   conftest.py     # 测试数据库隔离（临时文件）
   test_api.py     # 摄入 / 查询接口测试
   test_rollup.py  # 窗口聚合测试
+  test_alerts.py  # 阈值告警测试
 Dockerfile / docker-entrypoint.sh / docker-compose.yml
 requirements.txt / requirements-dev.txt
 ```

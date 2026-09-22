@@ -7,9 +7,21 @@ from typing import List, Optional
 from fastapi import FastAPI, Header, HTTPException, Query
 
 from . import db
+from .alerts import (
+    AlertRuleConflict,
+    AlertRuleError,
+    create_rule,
+    delete_rule,
+    get_rule,
+    update_rule,
+)
 from .logic import IdempotencyConflict, ingest_package
 from .rollup import RollupError, compute_rollup
 from .schemas import (
+    AlertEventsResponse,
+    AlertEventOut,
+    CurrentAlertOut,
+    CurrentAlertsResponse,
     CommittedResponse,
     DeviceState,
     DuplicatesResponse,
@@ -18,6 +30,10 @@ from .schemas import (
     IngestResponse,
     PackageIn,
     RollupResponse,
+    RuleCreate,
+    RuleListResponse,
+    RuleOut,
+    RuleUpdate,
 )
 
 
@@ -205,3 +221,192 @@ def get_metrics_rollup(
             )
         except RollupError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# 阈值告警规则
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/rules", response_model=RuleOut, status_code=201)
+def post_rule(rule_in: RuleCreate):
+    with db.ingest_lock, db.get_conn() as conn:
+        try:
+            rule = create_rule(
+                conn,
+                rule_in.device_id,
+                rule_in.metric,
+                rule_in.upper_limit,
+                rule_in.lower_limit,
+                rule_in.trigger_count,
+                rule_in.recovery_count,
+                rule_in.enabled,
+            )
+        except AlertRuleConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except AlertRuleError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return RuleOut(**conn.execute(
+            "SELECT * FROM alert_rules WHERE id = ?", (rule.id,)
+        ).fetchone())
+
+
+@app.get("/api/v1/rules", response_model=RuleListResponse)
+def list_rules(
+    device_id: Optional[str] = Query(default=None, description="按设备过滤"),
+    metric: Optional[str] = Query(default=None, description="按指标过滤"),
+):
+    where, params = [], []
+    if device_id:
+        where.append("device_id = ?")
+        params.append(device_id)
+    if metric:
+        where.append("metric = ?")
+        params.append(metric)
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM alert_rules {clause} ORDER BY id", params
+        ).fetchall()
+    return RuleListResponse(count=len(rows), rules=[RuleOut(**dict(r)) for r in rows])
+
+
+def _get_rule_or_404(conn, rule_id: int):
+    rule = get_rule(conn, rule_id)
+    if rule is None:
+        raise HTTPException(status_code=404, detail=f"规则不存在: {rule_id}")
+    return rule
+
+
+@app.get("/api/v1/rules/{rule_id}", response_model=RuleOut)
+def get_rule_detail(rule_id: int):
+    with db.get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM alert_rules WHERE id = ?", (rule_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"规则不存在: {rule_id}")
+        return RuleOut(**dict(row))
+
+
+@app.put("/api/v1/rules/{rule_id}", response_model=RuleOut)
+def put_rule(rule_id: int, rule_in: RuleUpdate):
+    with db.ingest_lock, db.get_conn() as conn:
+        _get_rule_or_404(conn, rule_id)
+        try:
+            update_rule(
+                conn,
+                rule_id,
+                rule_in.upper_limit,
+                rule_in.lower_limit,
+                rule_in.trigger_count,
+                rule_in.recovery_count,
+                rule_in.enabled,
+            )
+        except AlertRuleError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        row = conn.execute(
+            "SELECT * FROM alert_rules WHERE id = ?", (rule_id,)
+        ).fetchone()
+        return RuleOut(**dict(row))
+
+
+@app.delete("/api/v1/rules/{rule_id}", status_code=204)
+def remove_rule(rule_id: int):
+    with db.ingest_lock, db.get_conn() as conn:
+        if not delete_rule(conn, rule_id):
+            raise HTTPException(status_code=404, detail=f"规则不存在: {rule_id}")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 当前告警与告警事件
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/alerts", response_model=CurrentAlertsResponse)
+def get_current_alerts(
+    device_id: Optional[str] = Query(default=None, description="按设备过滤"),
+    metric: Optional[str] = Query(default=None, description="按指标过滤"),
+):
+    """当前仍处于告警状态的规则。triggered_* 取自最近一次触发事件。"""
+    where, params = ["s.state = 'triggered'", "r.enabled = 1"], []
+    if device_id:
+        where.append("r.device_id = ?")
+        params.append(device_id)
+    if metric:
+        where.append("r.metric = ?")
+        params.append(metric)
+    clause = " AND ".join(where)
+    sql = f"""
+        SELECT r.id               AS rule_id,
+               r.device_id        AS device_id,
+               r.metric           AS metric,
+               r.upper_limit      AS upper_limit,
+               r.lower_limit      AS lower_limit,
+               r.trigger_count    AS trigger_count,
+               r.recovery_count   AS recovery_count,
+               t.seq              AS triggered_seq,
+               t.id               AS triggered_event_id,
+               t.event_time       AS triggered_at,
+               s.last_value       AS last_value,
+               s.last_seq         AS last_seq,
+               s.recovery_streak  AS recovery_streak
+          FROM alert_rule_states s
+          JOIN alert_rules r ON r.id = s.rule_id
+          JOIN alert_events t
+            ON t.id = (
+                SELECT MAX(e.id) FROM alert_events e
+                 WHERE e.rule_id = r.id AND e.event_type = 'triggered'
+            )
+         WHERE {clause}
+         ORDER BY t.id
+    """
+    with db.get_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return CurrentAlertsResponse(
+        count=len(rows), alerts=[CurrentAlertOut(**dict(r)) for r in rows]
+    )
+
+
+@app.get("/api/v1/devices/{device_id}/alerts/events", response_model=AlertEventsResponse)
+def get_device_alert_events(
+    device_id: str,
+    metric: Optional[str] = Query(default=None, description="按指标过滤"),
+    event_type: Optional[str] = Query(
+        default=None, description="按事件类型过滤：triggered / recovered"
+    ),
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+):
+    """按设备（可选指标）分页查询告警事件，按事件序号升序返回。"""
+    with db.get_conn() as conn:
+        dev = conn.execute(
+            "SELECT 1 FROM devices WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        if dev is None:
+            raise HTTPException(status_code=404, detail=f"未知设备: {device_id}")
+        if event_type not in (None, "triggered", "recovered"):
+            raise HTTPException(
+                status_code=422,
+                detail="event_type 仅支持 triggered 或 recovered",
+            )
+        where, params = ["device_id = ?"], [device_id]
+        if metric:
+            where.append("metric = ?")
+            params.append(metric)
+        if event_type:
+            where.append("event_type = ?")
+            params.append(event_type)
+        clause = " AND ".join(where)
+        total = conn.execute(
+            f"SELECT COUNT(*) AS n FROM alert_events WHERE {clause}", params
+        ).fetchone()["n"]
+        rows = conn.execute(
+            f"SELECT * FROM alert_events WHERE {clause} ORDER BY id LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        ).fetchall()
+    return AlertEventsResponse(
+        count=total,
+        limit=limit,
+        offset=offset,
+        events=[AlertEventOut(**dict(r)) for r in rows],
+    )
