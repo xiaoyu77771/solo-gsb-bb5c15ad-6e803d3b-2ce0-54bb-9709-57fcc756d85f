@@ -56,6 +56,56 @@ CREATE TABLE IF NOT EXISTS duplicates (
 );
 
 CREATE INDEX IF NOT EXISTS idx_duplicates_device ON duplicates (device_id, id);
+
+-- 阈值告警规则：每台设备的每个指标至多一条规则
+CREATE TABLE IF NOT EXISTS alert_rules (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id      TEXT NOT NULL,
+    metric         TEXT NOT NULL,
+    upper          REAL,                       -- 上限；value >= upper 视为越限（null 表示不启用）
+    lower          REAL,                       -- 下限；value <= lower 视为越限（null 表示不启用）
+    trigger_count  INTEGER NOT NULL,           -- 连续越限多少次后触发告警
+    recover_count  INTEGER NOT NULL,           -- 告警中连续恢复多少次后解除
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE (device_id, metric)
+);
+
+-- 规则状态机持久化状态（与规则一一对应，随规则级联删除）
+CREATE TABLE IF NOT EXISTS alert_rule_states (
+    rule_id        INTEGER PRIMARY KEY REFERENCES alert_rules(id) ON DELETE CASCADE,
+    state          TEXT NOT NULL DEFAULT 'normal',  -- normal / alarm
+    consecutive    INTEGER NOT NULL DEFAULT 0,      -- 当前状态下的连续计数
+    evaluated_upto INTEGER NOT NULL DEFAULT 0,      -- 已评估到的最大提交序号（建规则前历史不回补）
+    trigger_kind   TEXT,                            -- 本次告警的越限方向：upper / lower
+    trigger_value  REAL,                            -- 触发时刻的测量值
+    triggered_seq  INTEGER,                         -- 触发包序号
+    triggered_at   TEXT,                            -- 触发时间（UTC ISO 8601）
+    last_seq       INTEGER,                         -- 最近评估的包序号
+    last_value     REAL                             -- 最近评估的测量值
+);
+
+-- 告警事件（触发 / 恢复），规则删除后保留审计轨迹，rule_id 置空
+CREATE TABLE IF NOT EXISTS alert_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id     INTEGER REFERENCES alert_rules(id) ON DELETE SET NULL,
+    device_id   TEXT NOT NULL,
+    metric      TEXT NOT NULL,
+    event_type  TEXT NOT NULL,                      -- triggered / recovered
+    kind        TEXT,                               -- upper / lower（仅 triggered）
+    seq         INTEGER NOT NULL,                   -- 产生事件的提交包序号
+    value       REAL NOT NULL,                      -- 产生状态跃迁的测量值
+    event_time  TEXT NOT NULL,                      -- 触发或恢复时间（UTC ISO 8601）
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_events_device_metric
+    ON alert_events (device_id, metric, id);
+CREATE INDEX IF NOT EXISTS idx_alert_rules_device_metric
+    ON alert_rules (device_id, metric);
+CREATE INDEX IF NOT EXISTS idx_alert_states_state
+    ON alert_rule_states (state);
 """
 
 

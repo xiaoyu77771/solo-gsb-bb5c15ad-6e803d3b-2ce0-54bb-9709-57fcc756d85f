@@ -12,6 +12,7 @@ import json
 import sqlite3
 from typing import Optional
 
+from . import alerts
 from .schemas import IngestResponse, PackageIn
 
 
@@ -141,6 +142,9 @@ def ingest_package(conn: sqlite3.Connection, pkg: PackageIn, key: str) -> Ingest
         conn.execute(
             "DELETE FROM buffer WHERE device_id = ? AND seq = ?", (pkg.device_id, cur)
         )
+        # 阈值告警：按提交顺序（seq 升序）每个提交包恰好评估一次。
+        # 重复包在更早就已返回，乱序缓冲的包只在排水提交时到达此处。
+        alerts.evaluate_package(conn, pkg.device_id, cur, row["payload_json"])
         committed_seqs.append(cur)
         cur += 1
 

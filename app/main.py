@@ -6,10 +6,14 @@ from typing import List, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Query
 
-from . import db
+from . import alerts, db
 from .logic import IdempotencyConflict, ingest_package
 from .rollup import RollupError, compute_rollup
 from .schemas import (
+    ActiveAlert,
+    ActiveAlertsResponse,
+    AlertEvent,
+    AlertEventsResponse,
     CommittedResponse,
     DeviceState,
     DuplicatesResponse,
@@ -18,6 +22,8 @@ from .schemas import (
     IngestResponse,
     PackageIn,
     RollupResponse,
+    RuleResponse,
+    RuleUpsert,
 )
 
 
@@ -205,3 +211,112 @@ def get_metrics_rollup(
             )
         except RollupError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+# --------------------------------------------------------------------------- #
+# 阈值告警规则
+# --------------------------------------------------------------------------- #
+@app.post(
+    "/api/v1/alert-rules",
+    response_model=RuleResponse,
+    status_code=201,
+    tags=["alerts"],
+)
+def create_alert_rule(body: RuleUpsert, device_id: str = Query(min_length=1), metric: str = Query(min_length=1)):
+    with db.ingest_lock, db.get_conn() as conn:
+        try:
+            return alerts.create_rule(conn, device_id, metric, body)
+        except alerts.RuleConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/alert-rules", response_model=List[RuleResponse], tags=["alerts"])
+def list_alert_rules(
+    device_id: Optional[str] = Query(default=None),
+    metric: Optional[str] = Query(default=None),
+):
+    with db.get_conn() as conn:
+        return alerts.list_rules(conn, device_id, metric)
+
+
+@app.get("/api/v1/alert-rules/{rule_id}", response_model=RuleResponse, tags=["alerts"])
+def get_alert_rule(rule_id: int):
+    with db.get_conn() as conn:
+        rule = alerts.get_rule(conn, rule_id)
+    if rule is None:
+        raise HTTPException(status_code=404, detail=f"告警规则不存在: {rule_id}")
+    return rule
+
+
+@app.put("/api/v1/alert-rules/{rule_id}", response_model=RuleResponse, tags=["alerts"])
+def update_alert_rule(rule_id: int, body: RuleUpsert):
+    with db.ingest_lock, db.get_conn() as conn:
+        rule = alerts.update_rule(conn, rule_id, body)
+    if rule is None:
+        raise HTTPException(status_code=404, detail=f"告警规则不存在: {rule_id}")
+    return rule
+
+
+@app.delete(
+    "/api/v1/alert-rules/{rule_id}",
+    status_code=204,
+    tags=["alerts"],
+)
+def delete_alert_rule(rule_id: int):
+    with db.ingest_lock, db.get_conn() as conn:
+        deleted = alerts.delete_rule(conn, rule_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"告警规则不存在: {rule_id}")
+
+
+# --------------------------------------------------------------------------- #
+# 当前告警 / 告警事件查询
+# --------------------------------------------------------------------------- #
+@app.get("/api/v1/alerts", response_model=ActiveAlertsResponse, tags=["alerts"])
+def list_active_alerts(
+    device_id: Optional[str] = Query(default=None),
+    metric: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+):
+    with db.get_conn() as conn:
+        total, rows = alerts.list_active_alerts(
+            conn, device_id, metric, limit, offset
+        )
+    return ActiveAlertsResponse(
+        count=total,
+        limit=limit,
+        offset=offset,
+        alerts=[ActiveAlert(**r) for r in rows],
+    )
+
+
+@app.get(
+    "/api/v1/devices/{device_id}/alert-events",
+    response_model=AlertEventsResponse,
+    tags=["alerts"],
+)
+def list_alert_events(
+    device_id: str,
+    metric: Optional[str] = Query(default=None, min_length=1),
+    type: Optional[str] = Query(default=None, pattern="^(triggered|recovered)$"),
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+):
+    with db.get_conn() as conn:
+        dev = conn.execute(
+            "SELECT 1 FROM devices WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        if dev is None:
+            raise HTTPException(status_code=404, detail=f"未知设备: {device_id}")
+        total, rows = alerts.list_events(
+            conn, device_id, metric, type, limit, offset
+        )
+    return AlertEventsResponse(
+        device_id=device_id,
+        metric=metric,
+        count=total,
+        limit=limit,
+        offset=offset,
+        events=[AlertEvent(**dict(r)) for r in rows],
+    )

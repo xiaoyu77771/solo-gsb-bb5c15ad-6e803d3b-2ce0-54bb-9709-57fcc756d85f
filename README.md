@@ -5,19 +5,20 @@
 - **幂等去重**：每个包携带幂等键，重试 / 重发不会产生重复数据；
 - **乱序缓冲**：序号不连续的包先暂存，缺口补齐后**按序连续提交**；
 - **可观测接口**：查询每台设备的缺口、已提交序号与重复包记录；
-- **窗口聚合**：按事件时间（`sent_at`）把已提交测量分入半开窗口，输出 count / min / max / mean，并以水位机制隔离迟到样本。
+- **窗口聚合**：按事件时间（`sent_at`）把已提交测量分入半开窗口，输出 count / min / max / mean，并以水位机制隔离迟到样本；
+- **阈值告警**：为设备指标配置上限 / 下限与连续触发、连续恢复次数；已提交测量驱动带迟滞的状态机，规则状态与触发 / 恢复事件持久化在 SQLite。
 
 ## 快速开始
 
 ### Docker Compose（推荐）
 
-单条命令启动（构建镜像 + 安装依赖 + 建库 + 起服务）：
+单条命令启动（构建镜像 + 安装依赖 + 建库建表 + 起服务，告警相关表随应用启动钩子自动初始化）：
 
 ```bash
 docker compose up --build
 ```
 
-容器启动时自动安装依赖（`docker-entrypoint.sh`），应用启动钩子自动创建 SQLite 数据库与表结构。数据库文件持久化在命名卷 `lab-data`（容器内 `/data/lab.db`）。
+容器启动时自动安装依赖（`docker-entrypoint.sh`），应用启动钩子自动创建 SQLite 数据库与**全部**表结构（含告警规则、规则状态、告警事件三张表，对已有数据库幂等新增）。数据库文件持久化在命名卷 `lab-data`（容器内 `/data/lab.db`）。
 
 服务地址：http://localhost:8000 ，交互式文档：http://localhost:8000/docs
 
@@ -74,6 +75,13 @@ pytest tests/                         # 运行测试
 | GET | `/api/v1/devices/{id}/committed` | 已提交序号（支持 `from_seq`/`to_seq`/`limit`/`offset`） |
 | GET | `/api/v1/devices/{id}/duplicates` | 重复包记录（可按 `reason` 过滤） |
 | GET | `/api/v1/devices/{id}/metrics/rollup` | 按事件时间的窗口聚合（count/min/max/mean + 水位迟到统计） |
+| POST | `/api/v1/alert-rules?device_id=&metric=` | 创建阈值告警规则（201；同设备同指标重复创建 409） |
+| GET | `/api/v1/alert-rules` | 规则列表（可按 `device_id` / `metric` 过滤，含实时状态） |
+| GET | `/api/v1/alert-rules/{id}` | 查询单条规则及其状态 |
+| PUT | `/api/v1/alert-rules/{id}` | 更新规则（整体替换；状态保留、连续计数清零） |
+| DELETE | `/api/v1/alert-rules/{id}` | 删除规则及状态（已产生的事件保留） |
+| GET | `/api/v1/alerts` | 当前告警（可按 `device_id`/`metric` 过滤，分页） |
+| GET | `/api/v1/devices/{id}/alert-events` | 告警事件（触发/恢复时间与序号，分页） |
 
 ## 窗口聚合（Rollup）
 
@@ -103,6 +111,70 @@ curl 'localhost:8000/api/v1/devices/ph-meter-01/metrics/rollup?metric=temperatur
 #     "watermark":"2026-09-22T08:59:00Z","late_count":0,
 #     "windows":[{"start":"...","end":"...","count":3,"min":21.0,"max":21.6,"mean":21.3}, ...]}
 ```
+
+## 阈值告警（Alerts）
+
+### 规则
+
+每台设备的每个指标至多一条规则，参数：
+
+| 字段 | 说明 |
+|---|---|
+| `upper` / `lower` | 上限 / 下限，至少提供一个；`value >= upper` 或 `value <= lower` 视为越限（边界包含）；`lower` 必须严格小于 `upper` |
+| `trigger_count` | 连续越限达到该次数后触发告警（默认 1） |
+| `recover_count` | 告警中连续恢复（测量值回到限内）达到该次数后解除（默认 1） |
+| `enabled` | 是否启用；停用期间提交的包不评估、不补评 |
+
+```bash
+# 温度连续 3 次超 30℃ 触发，连续 2 次回到 30℃ 以下解除
+curl -X POST 'localhost:8000/api/v1/alert-rules?device_id=ph-meter-01&metric=temperature' \
+  -H 'Content-Type: application/json' \
+  -d '{"upper": 30.0, "trigger_count": 3, "recover_count": 2}'
+```
+
+### 迟滞状态机
+
+规则状态持久化在 SQLite（`alert_rule_states`），每条规则独立运行：
+
+- **normal**：样本越限则越限计数 +1，达到 `trigger_count` 时跃迁为 **alarm**，记录 `triggered` 事件；中间任意一个正常样本会把计数清零（连续计数，天然防抖）；
+- **alarm**：样本回到限内则恢复计数 +1，达到 `recover_count` 时恢复 **normal**，记录 `recovered` 事件；中间再次越限则计数清零、告警保持，**不会重复产生触发事件**。
+
+评估时机与摄入语义完全一致：
+
+- 只有**按序提交（committed）**的测量值才驱动状态机——每个提交包按提交顺序（seq 升序）**恰好评估一次**；
+- **重复包不产生事件**：幂等键重放、`already_committed`、`already_buffered` 都在评估之前返回；
+- **乱序 / 缺口补齐**：缓冲中的包不评估；缺口补齐触发排水时，缓冲包按 seq 升序各评估一次（只按一次提交顺序处理）；
+- 一个包内同一指标出现多次时，按 `measurements` 出现顺序逐个驱动状态机；
+- **建规则前的历史包不回补**：规则创建时 `evaluated_upto` 初始化为设备当前 `committed_upto`，仅评估之后提交的包；
+- 更新规则保留 normal/alarm 状态但清零连续计数；删除规则删除其状态，**已产生的事件作为审计记录保留**（事件的 `rule_id` 置空）。
+
+### 查询
+
+当前告警（含触发时间与触发包序号）：
+
+```bash
+curl 'localhost:8000/api/v1/alerts?device_id=ph-meter-01&metric=temperature'
+# => {"count":1,"limit":100,"offset":0,"alerts":[{
+#   "rule_id":1,"device_id":"ph-meter-01","metric":"temperature","state":"alarm",
+#   "trigger_kind":"upper","trigger_value":31.2,
+#   "triggered_seq":42,"triggered_at":"2026-09-22T08:05:12.345Z",
+#   "consecutive":0,"last_seq":43,"last_value":30.8,"upper":30.0,"lower":null}]}
+```
+
+按设备、指标分页查询事件（`type=triggered|recovered` 可选，`limit`/`offset` 分页）：
+
+```bash
+curl 'localhost:8000/api/v1/devices/ph-meter-01/alert-events?metric=temperature&limit=50'
+# => {"device_id":"ph-meter-01","metric":"temperature","count":2,"limit":50,"offset":0,
+#     "events":[
+#   {"id":1,"rule_id":1,"device_id":"ph-meter-01","metric":"temperature",
+#    "event_type":"triggered","kind":"upper","seq":42,"value":31.2,
+#    "event_time":"2026-09-22T08:05:12.345Z","created_at":"..."},
+#   {"id":2,"rule_id":1,...,"event_type":"recovered","kind":null,"seq":51,"value":29.8,
+#    "event_time":"2026-09-22T08:20:03.910Z","created_at":"..."}]}
+```
+
+事件按 `id`（即实际处理顺序）升序返回，`seq` 为产生该事件的提交包序号，`event_time` 为触发或恢复时间（UTC ISO 8601）。
 
 ### 示例
 
@@ -150,12 +222,14 @@ app/
   main.py     # FastAPI 路由
   logic.py    # 摄入核心：幂等判定、缓冲、排水提交
   rollup.py   # 窗口聚合：半开窗口分桶、水位迟到判定
+  alerts.py   # 阈值告警：规则 CRUD、连续计数迟滞状态机、事件查询
   db.py       # SQLite 连接与建表（启动时自动执行）
   schemas.py  # Pydantic 模型
 tests/
   conftest.py     # 测试数据库隔离（临时文件）
   test_api.py     # 摄入 / 查询接口测试
   test_rollup.py  # 窗口聚合测试
+  test_alerts.py  # 阈值告警测试
 Dockerfile / docker-entrypoint.sh / docker-compose.yml
 requirements.txt / requirements-dev.txt
 ```
